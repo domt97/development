@@ -41,7 +41,8 @@ resource "aws_s3_bucket" "store_products" {
 # --------------------------------------------------
 
 resource "aws_sqs_queue" "reservation_expire_queue" {
-  name = "${var.profile}-reservation-expire-queue"
+  name                       = "${var.profile}-reservation-expire-queue"
+  visibility_timeout_seconds = 90
 }
 
 # --------------------------------------------------
