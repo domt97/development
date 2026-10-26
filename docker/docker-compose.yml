@@ -152,7 +152,7 @@ services:
     environment:
       - AWS_DEFAULT_REGION=eu-west-1
       - EDGE_PORT=4566
-      - SERVICES=s3,dynamodb,sqs,events
+      - SERVICES=s3,sqs,events
     ports:
       - '4566-4597:4566-4597'
     volumes:
