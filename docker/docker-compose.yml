@@ -146,6 +146,13 @@ services:
 
       CONNECT_PLUGIN_PATH: "/usr/share/java,/usr/share/confluent-hub-components"
 
+      # Secrets for connector configs: "${file:/opt/connect-secrets/<file>:<key>}" (see kafka-connect/secrets/*.example).
+      CONNECT_CONFIG_PROVIDERS: file
+      CONNECT_CONFIG_PROVIDERS_FILE_CLASS: org.apache.kafka.common.config.provider.FileConfigProvider
+
+    volumes:
+      - ./kafka-connect/secrets:/opt/connect-secrets:ro
+
   localstack:
     image: localstack/localstack:3.8.1
     container_name: localstack

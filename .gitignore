@@ -15,3 +15,6 @@
 # IntelliJ IDEA
 .idea/
 *.iml
+# Kafka Connect secrets (only the .example files are committed)
+docker/kafka-connect/secrets/*
+!docker/kafka-connect/secrets/*.example
