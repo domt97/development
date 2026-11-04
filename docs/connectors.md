@@ -41,18 +41,38 @@ Debezium 2.2.1 reads `store.outbox_events` and the `EventRouter` publishes each 
 
 The `EventRouter` reads every `table.fields.additional.placement` column from each change event. Change events written
 before the column existed do not have it, and the task is **expected** to fail on them (all events stop until rollback;
-nothing is lost, rows wait in the outbox; confirm and record this the first time you test it). So apply the new
-config only after the replication slot has passed the migration:
+nothing is lost, rows wait in the outbox). So apply the new config only once the connector has read every change event
+written before the migration. Run the commands from `docker/`.
 
-1. Deploy stores-service with the migration (e.g. `V9`).
-2. Record the WAL position right after it:
-   `docker exec -it postgres psql -U postgres -d store -c "SELECT pg_current_wal_lsn();"`
-3. Create or update one product (so the connector reads a change event with the new column).
-4. Wait until the slot has confirmed past that position (at least `offset.flush.interval.ms`, 60 s by default):
-   `SELECT confirmed_flush_lsn >= '<lsn from step 2>' FROM pg_replication_slots WHERE slot_name = 'debezium_store_v2_slot';`
-   must return `t`.
+1. Deploy stores-service with the migration (e.g. `V9`) and keep the current connector running.
+2. Note when the migration ran:
+   `docker exec -it postgres psql -U postgres -d store -c "SELECT version, installed_on FROM store.flyway_schema_history WHERE version = '9';"`
+   (drop `store.` if the table is in another schema). `installed_on` is in the database session's local time, while
+   `outbox_events.created_at` is written in UTC: convert before comparing (e.g. `22:16` in UTC+7 is `15:16` UTC).
+3. Create or update one product **after** that time (an update must change a field, otherwise nothing is written).
+4. Check that this newest outbox row has the column and that the current connector has published it:
+   - `docker exec -it postgres psql -U postgres -d store -c "SELECT event_type, created_at, correlation_context FROM store.outbox_events ORDER BY created_at DESC LIMIT 3;"`
+     — the newest row is after the migration and its `correlation_context` is not `{}` (rows from before the migration
+     show the default `{}`);
+   - the record is on its topic (`ProductCreated` or `ProductUpdated`, consumer command in **Verify**, without the header
+     check).
+
+   Debezium reads the outbox in WAL order, so once it has published a row written after the migration it has also read
+   every change event before it: none without the column is left to read.
 5. `./kafka-connect/register-connectors.sh postgres-cdc`
 6. **Verify.**
+
+Alternative to step 4, by WAL position (slot `debezium_store_v2_slot`):
+- record `SELECT pg_current_wal_lsn();` **right after** the migration, before any new outbox row; a position taken later
+  is past every event and is only reached by events written after it;
+- after writing a product, wait at least `offset.flush.interval.ms` (60 s by default):
+  `SELECT confirmed_flush_lsn >= '<lsn>' FROM pg_replication_slots WHERE slot_name = 'debezium_store_v2_slot';` must
+  return `t`. `confirmed_flush_lsn` only moves to the last event the connector has processed, never to
+  `pg_current_wal_lsn()`, so never compare with the current position.
+
+First application (2026-11-04, local stack, Debezium 2.2.1): applied after V9 with the step 4 check; the task stayed
+`RUNNING`, the header reached `ProductCreated` and inventory-service logged the same `requestId`. Whether the task
+really fails on a pre-migration event was not tested.
 
 **Rollback:** restore the previous `connectors/postgres-cdc.json` (git), run the script again, and restart the task if it
 stays `FAILED` (`curl -X POST localhost:9084/connectors/postgres-cdc/tasks/0/restart`). The old config ignores the column.
