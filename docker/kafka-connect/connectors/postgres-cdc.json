@@ -1,0 +1,23 @@
+{
+  "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+  "database.hostname": "postgres",
+  "database.port": "5432",
+  "database.user": "${file:/opt/connect-secrets/postgres-cdc.properties:user}",
+  "database.password": "${file:/opt/connect-secrets/postgres-cdc.properties:password}",
+  "database.dbname": "store",
+  "topic.prefix": "store",
+  "plugin.name": "pgoutput",
+  "slot.name": "debezium_store_v2_slot",
+  "publication.name": "debezium_store_v2_publication",
+  "publication.autocreate.mode": "filtered",
+  "table.include.list": "store.outbox_events",
+  "tombstones.on.delete": "false",
+  "header.converter": "org.apache.kafka.connect.storage.SimpleHeaderConverter",
+  "transforms": "outbox",
+  "transforms.outbox.type": "io.debezium.transforms.outbox.EventRouter",
+  "transforms.outbox.route.by.field": "event_type",
+  "transforms.outbox.route.topic.replacement": "${routedByValue}",
+  "transforms.outbox.table.field.event.key": "aggregate_id",
+  "transforms.outbox.table.field.event.payload": "payload",
+  "transforms.outbox.table.fields.additional.placement": "correlation_context:header:correlationContext"
+}
