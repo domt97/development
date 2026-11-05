@@ -10,6 +10,7 @@
   "slot.name": "debezium_store_v2_slot",
   "publication.name": "debezium_store_v2_publication",
   "publication.autocreate.mode": "filtered",
+  "snapshot.mode": "never",
   "table.include.list": "store.outbox_events",
   "tombstones.on.delete": "false",
   "header.converter": "org.apache.kafka.connect.storage.SimpleHeaderConverter",

@@ -19,23 +19,33 @@ chmod 644 kafka-connect/secrets/postgres-cdc.properties    # readable by the con
 docker compose up -d --force-recreate kafka-connect        # picks up the config provider and the mount
 ```
 
-## First setup (new database only)
+## First setup, and after a Kafka reset
 
-Use this only when no `postgres-cdc` connector exists yet **and** stores-service already runs the latest migration
-(currently `V9`, which adds `outbox_events.correlation_context`). Otherwise follow **Changing the outbox connector**.
+The connector's config, offsets and status live in Kafka topics (`_connect_*`, kept in the `kafka_data` volume,
+`docs/local-data.md`). When Kafka starts empty (new stack, or `kafka_data` deleted) there is no connector: register it.
 
 ```bash
-curl -s localhost:9084/connectors          # must not list a connector on slot debezium_store_v2_slot
+curl -s localhost:9084/connectors          # [] : nothing registered
 ./kafka-connect/register-connectors.sh
 ```
 
-Then **Verify**.
+Then **Verify**. `snapshot.mode=never`: the connector never re-reads the table, it only streams the WAL from its
+replication slot:
+- slot `debezium_store_v2_slot` still in Postgres (Kafka reset only) → it resumes where the slot stopped: outbox rows
+  written while Kafka was down are published, rows published before are **not** published again;
+- new database (no slot) → the slot is created now and only rows written from now on are published. Register the
+  connector before creating products, or re-save them so they produce new outbox rows.
+
+stores-service must already run the latest migration (currently `V9`, `outbox_events.correlation_context`); otherwise
+see **Changing the outbox connector**.
 
 ## `postgres-cdc` (stores-service outbox)
 
 Debezium 2.2.1 reads `store.outbox_events` and the `EventRouter` publishes each row to the topic named by
 `event_type`, keyed by `aggregate_id`, with `payload` as the value. The column `correlation_context` (stores-service
-`V9`) goes to the Kafka header `correlationContext` as JSON text (ADR 0004 in oms-workspace).
+`V9`) goes to the Kafka header `correlationContext` as JSON text (ADR 0004 in oms-workspace). `snapshot.mode=never`
+(above): with the default `initial`, a connector without offsets would publish every row of `outbox_events` again, and
+inventory's `ProductCreatedConsumer` is not idempotent yet.
 
 ## Changing the outbox connector (adding a placed column)
 

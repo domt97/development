@@ -29,6 +29,10 @@ services:
       ZOOKEEPER_TICK_TIME: 2000
     ports:
       - 2181:2181
+    # Kafka's cluster id and topic metadata live here: keep it together with kafka_data (docs/local-data.md).
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper/data
+      - zookeeper_log:/var/lib/zookeeper/log
 
   kafka:
     image: confluentinc/cp-kafka:7.3.0
@@ -49,6 +53,9 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       JMX_PORT: 9997
       KAFKA_JMX_OPTS: -Dcom.sun.management.jmxremote -Dcom.sun.management.jmxremote.authenticate=false -Dcom.sun.management.jmxremote.ssl=false -Djava.rmi.server.hostname=kafka -Dcom.sun.management.jmxremote.rmi.port=9997
+    # Topics, consumer offsets, Kafka Connect's configs/offsets/status and Schema Registry's _schemas.
+    volumes:
+      - kafka_data:/var/lib/kafka/data
 
 #  connect:
 #    image: debezium/connect:2.7
@@ -184,8 +191,11 @@ services:
   redis:
     image: redis:7
     container_name: redis-cache
+    command: ["redis-server", "--appendonly", "yes"]
     ports:
       - "6379:6379"
+    volumes:
+      - redis_data:/data
 
   postgres:
     image: postgres:16
@@ -215,5 +225,11 @@ services:
       timeout: 5s
       retries: 10
 
+# Named volumes survive `docker compose down` and restarts; only `down -v` or `docker volume rm` deletes them
+# (docs/local-data.md).
 volumes:
   postgres_data: {}
+  zookeeper_data: {}
+  zookeeper_log: {}
+  kafka_data: {}
+  redis_data: {}
