@@ -183,7 +183,8 @@ SQL
 
 d. After a few seconds: `echo $(( $(offsets) - BEFORE ))` prints **2**. Then
    `docker exec -e JMX_PORT= -e KAFKA_JMX_OPTS= kafka kafka-console-consumer --bootstrap-server kafka:29092 --topic StockReservationExpired --from-beginning --property print.headers=true --property print.key=true --timeout-ms 10000 | grep -E "$E1|$E2"`
-   shows two records: key `$O1` / `$O2`, header `id:$E1` / `id:$E2`, `correlationContext:{"requestId":"verify-outbox-1"}`.
+   shows two records: key `$O1` / `$O2`, header `id:$E1` / `id:$E2`, `correlationContext:{"requestId": "verify-outbox-1"}`
+   (JSONB adds the space).
    The delta of exactly 2 is the proof that no extra record (a tombstone or a delete event) was written.
 e. `curl -s localhost:9084/connectors/inventory-outbox-cdc/status` — connector and task still `RUNNING`;
    `psql_inv -tAc "SELECT count(*) FROM inventory.outbox_events"` — `0`.
@@ -211,7 +212,8 @@ The two verify records stay in `StockReservationExpired` for 14 days with unknow
 - **Task RUNNING does not prove the heartbeat**: Debezium 2.2 is expected to only log most failures of
   `heartbeat.action.query` (`docker logs --since 10m kafka-connect 2>&1 | grep "Could not execute heartbeat action"`)
   and keep running; some connection errors may fail the task instead. Record which case was tested in *First
-  application* (e.g. revoke INSERT on `debezium_heartbeat` for a minute). Check `max(beat_at)` (Verify f).
+  application* (e.g. rename `debezium_heartbeat` for two minutes and rename it back; revoking INSERT has no effect
+  while the connector uses the superuser `postgres` of the example secrets file). Check `max(beat_at)` (Verify f).
 - **Connector or task FAILED**: read the trace (`curl -s localhost:9084/connectors/inventory-outbox-cdc/status`), fix
   the cause (or restore the previous `connectors/inventory-outbox-cdc.json` from git and re-run the script), then
   `curl -X POST localhost:9084/connectors/inventory-outbox-cdc/tasks/0/restart`.
@@ -228,7 +230,19 @@ The two verify records stay in `StockReservationExpired` for 14 days with unknow
 
 ### First application
 
-Not applied yet. Fill in after the first run on a local stack: date, Debezium and Postgres versions, results of a–g, and which
-heartbeat-failure case was tested (runbook).
-Until then the condition of open question 19 (one record per reply, no tombstone, task RUNNING) is **not proven**.
+2026-11-09, local stack (Debezium Postgres connector 2.2.1 on cp-kafka-connect 7.3.0, Postgres 16, macOS, zsh).
+SQL script, `create-topics.sh` and `register-connectors.sh` as in *First setup*; both connectors `RUNNING`.
+
+- a. publication `t t f f f`, tables `debezium_heartbeat` and `outbox_events`.
+- b–d. two replies inserted and deleted in one transaction: offset delta **2**; two records with key = orderId, header
+  `id` = eventId and `correlationContext:{"requestId": "verify-outbox-1"}`; JSONB normalises the spacing and the
+  payload's key order; no tombstone or delete event.
+- e. connector and task still `RUNNING`; `outbox_events` count `0`.
+- f. `confirmed_flush_lsn` passed `L` within about 3 minutes (first poll `f` at 21:04:30, `t` at 21:07:01; heartbeat
+  60 s + offset flush 60 s); `max(beat_at)` fresh, 4 rows; of the heartbeat topics only `__debezium-heartbeat.inventory`
+  exists, no `inventory.inventory.debezium_heartbeat`.
+- g. `debezium_inventory_slot` active, `reserved`, 1832 bytes behind.
+
+The condition of open question 19 (one record per reply, no tombstone, task RUNNING) holds locally. **Not tested:** a
+failing heartbeat query (runbook), and the behaviour after a Kafka or Connect restart.
 
