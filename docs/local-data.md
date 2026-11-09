@@ -2,7 +2,7 @@
 
 | Service | Data | Where it is kept |
 |---------|------|------------------|
-| postgres | databases `store`, `inventory`, Debezium's replication slot | named volume `postgres_data` |
+| postgres | databases `store`, `inventory`, Debezium's replication slots (`debezium_store_v2_slot`, `debezium_inventory_slot`), the publications and `inventory.debezium_heartbeat` | named volume `postgres_data` |
 | zookeeper | Kafka cluster id, topic and broker metadata | named volumes `zookeeper_data`, `zookeeper_log` |
 | kafka | topics, consumer offsets, Kafka Connect's connector configs, offsets and status (`_connect_*`), Schema Registry's `_schemas` | named volume `kafka_data` |
 | redis | cache (append-only file) | named volume `redis_data` |
@@ -23,16 +23,23 @@ and Kafka Connect refuses to start (see *Kafka Connect exits after a Kafka reset
   `InconsistentClusterIdException`):
   ```bash
   cd docker
-  docker compose down --remove-orphans          # keeps every volume (only down -v deletes them)
-  docker volume rm docker_kafka_data docker_zookeeper_data docker_zookeeper_log   # docker volume ls for the names
+  # keeps every volume (only down -v deletes them)
+  docker compose down --remove-orphans
+  # docker volume ls for the names
+  docker volume rm docker_kafka_data docker_zookeeper_data docker_zookeeper_log
   docker compose up -d
-  docker logs --since 3m kafka-connect 2>&1 | grep -E "Kafka Connect started|ERROR"   # wait for "started", no ERROR
-  ./kafka-connect/register-connectors.sh        # the new Kafka has no connector
+  # wait for "started", no ERROR
+  docker logs --since 3m kafka-connect 2>&1 | grep -E "Kafka Connect started|ERROR"
+  # before the connectors: the slots resume and would auto-create topics
+  ./kafka/create-topics.sh
+  # the new Kafka has no connector
+  ./kafka-connect/register-connectors.sh
   ```
   Then start stores-service and inventory-service. Postgres keeps the slot, so nothing is published twice and nothing
   written meanwhile is lost (`docs/connectors.md`, *First setup, and after a Kafka reset*).
 - **Everything:** stop the services, `docker compose down -v`, then `docker compose up -d`, Terraform in `infra/local`,
-  and the connector's first setup.
+  and the connectors' first setup (`docs/connectors.md`: start inventory-service once, topics, publication SQL,
+  register).
 
 ## Switching to these volumes (once)
 
@@ -42,11 +49,16 @@ recreates only `kafka` and `zookeeper`, and the still-running `kafka-connect` br
 
 ```bash
 cd docker
-docker compose down --remove-orphans          # stop stores-service and inventory-service too
+# stop stores-service and inventory-service too
+docker compose down --remove-orphans
 docker compose up -d
 docker logs --since 3m kafka-connect 2>&1 | grep -E "Kafka Connect started|ERROR"
-./kafka-connect/register-connectors.sh                    # Kafka is new: the connector must be registered again
-curl -s localhost:9084/connectors/postgres-cdc/status     # connector and task RUNNING
+# topics first, with their partitions
+./kafka/create-topics.sh
+# Kafka is new: the connectors must be registered again
+./kafka-connect/register-connectors.sh
+# connector and task RUNNING
+curl -s localhost:9084/connectors/postgres-cdc/status
 ```
 
 Then start the services. The old anonymous volumes can be removed with `docker volume prune`.
@@ -67,7 +79,9 @@ kt --describe --topic '_connect_offsets|_connect_status|_connect_configs|_schema
 kt --delete --topic '_connect_offsets|_connect_status|_connect_configs|_schemas'
 docker compose up -d kafka-connect schemaregistry
 docker logs --since 3m kafka-connect 2>&1 | grep -E "Kafka Connect started|ERROR"
-kt --describe --topic _connect_offsets | head -1           # PartitionCount: 25, cleanup.policy=compact
+# PartitionCount: 25, cleanup.policy=compact
+kt --describe --topic _connect_offsets | head -1
+./kafka/create-topics.sh
 ./kafka-connect/register-connectors.sh
 ```
 
