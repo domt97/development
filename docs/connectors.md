@@ -24,8 +24,14 @@ docker compose up -d --force-recreate kafka-connect
 
 | Connector | Database / table | Slot | Publication | Topics |
 |-----------|------------------|------|-------------|--------|
-| `postgres-cdc` | `store.outbox_events` (stores-service) | `debezium_store_v2_slot` | `debezium_store_v2_publication` (created by Debezium, `filtered`) | `ProductCreated`, `ProductUpdated` (auto-created) |
-| `inventory-outbox-cdc` | `inventory.outbox_events` (inventory-service V5) + `inventory.debezium_heartbeat` | `debezium_inventory_slot` | `debezium_inventory_publication` (created by `sql/inventory-outbox-cdc.sql`, insert-only) | the stock replies of ADR 0006 (pre-created) |
+| `postgres-cdc` | `store.outbox_events` (stores-service) + `store.debezium_heartbeat` | `debezium_store_v2_slot` | `debezium_store_v2_publication` (`sql/store-outbox-cdc.sql`, insert-only; first created by Debezium's former `filtered` autocreate) | `ProductCreated`, `ProductUpdated` (auto-created) |
+| `inventory-outbox-cdc` | `inventory.outbox_events` (inventory-service V5) + `inventory.debezium_heartbeat` | `debezium_inventory_slot` | `debezium_inventory_publication` (`sql/inventory-outbox-cdc.sql`, insert-only) | the stock replies of ADR 0006 (pre-created) |
+
+Both services insert each outbox row with `id` = the payload `eventId` and **delete it in the same transaction**
+(inventory-service since inventory-service#40, stores-service since stores-service#59): the
+tables are always empty, the INSERT reaches Kafka only through the WAL, and the insert-only publications never send the
+DELETEs (`tombstones.on.delete=false` and the EventRouter, which ignores DELETE operations on an outbox, are the second
+and third guard). Consequence: a lost or recreated slot loses the events of the gap for good (runbooks below).
 
 ## First setup, and after a Kafka reset
 
@@ -34,95 +40,138 @@ The connectors' configs, offsets and status live in Kafka topics (`_connect_*`, 
 them. Run from `docker/`, in this order:
 
 ```bash
-# 1. inventory-service started once (Flyway V5 creates inventory.outbox_events); stores-service too for postgres-cdc.
+# 1. stores-service (Flyway V9 or later) and inventory-service (Flyway V5) started once.
 # 2. topics with their partitions, before anything can auto-create them (idempotent)
 ./kafka/create-topics.sh
-# 3. publication + heartbeat table for inventory-outbox-cdc (once per database; idempotent, refuses before V5)
+# 3. publications + heartbeat tables (once per database; idempotent, refuse before V9 / V5)
+docker exec -i postgres psql -1 -v ON_ERROR_STOP=1 -U postgres -d store -f - < kafka-connect/sql/store-outbox-cdc.sql
 docker exec -i postgres psql -1 -v ON_ERROR_STOP=1 -U postgres -d inventory -f - < kafka-connect/sql/inventory-outbox-cdc.sql
-# 4. connectors (every one is attempted; exits non-zero if any is not RUNNING)
+# 4. connectors (every one is attempted; exits non-zero if any is not RUNNING or its publication has the wrong shape)
 # an empty list means nothing is registered yet
 curl -s localhost:9084/connectors
 ./kafka-connect/register-connectors.sh
 ```
 
-After a **Kafka reset** only steps 2 and 4 are needed (Postgres keeps the slots, the publication and the table): step
-2 **before** step 4, otherwise the first reply re-creates its topic with 1 partition.
+After a **Kafka reset** only steps 2 and 4 are needed (Postgres keeps the slots, the publications and the tables):
+step 2 **before** step 4, otherwise the first reply re-creates its topic with 1 partition.
 
 Then **Verify**. `snapshot.mode=never`: the connector never re-reads the table, it only streams the WAL from its
 replication slot:
-- slot `debezium_store_v2_slot` still in Postgres (Kafka reset only) → it resumes where the slot stopped: outbox rows
-  written while Kafka was down are published, rows published before are **not** published again;
-- new database (no slot) → the slot is created now and only rows written from now on are published. Register the
-  connector before creating products, or re-save them so they produce new outbox rows. For `inventory-outbox-cdc`,
-  replies written before its slot exists are never published (only the expiry can write them today).
+- slot still in Postgres (Kafka reset only) → it resumes where the slot stopped: events written while Kafka was down
+  are published, events published before are **not** published again;
+- new database (no slot) → the slot is created now and only events written from now on are published. Register the
+  connectors before creating products (or give each product a real change later); for `inventory-outbox-cdc`, replies
+  written before its slot exists are never published (only the expiry can write them today).
   (`snapshot.mode=never` is renamed `no_data` in later Debezium versions: check it on an upgrade.)
-
-stores-service must already run the latest migration (currently `V9`, `outbox_events.correlation_context`); otherwise
-see **Changing the outbox connector**.
 
 ## `postgres-cdc` (stores-service outbox)
 
 Debezium 2.2.1 reads `store.outbox_events` and the `EventRouter` publishes each row to the topic named by
-`event_type`, keyed by `aggregate_id`, with `payload` as the value. The column `correlation_context` (stores-service
-`V9`) goes to the Kafka header `correlationContext` as JSON text (ADR 0004 in oms-workspace). `snapshot.mode=never`
-(above): with the default `initial`, a connector without offsets would publish every row of `outbox_events` again, and
-inventory's `ProductCreatedConsumer` is not idempotent yet.
+`event_type`, keyed by `aggregate_id`, with `payload` as the value and the header `id` = the row `id` = the payload
+`eventId`. The column `correlation_context` (stores-service `V9`) goes to the Kafka header `correlationContext` as JSON
+text (ADR 0004 in oms-workspace). stores-service must run at least `V9`. Settings as `inventory-outbox-cdc` (below):
+insert-only publication from `kafka-connect/sql/store-outbox-cdc.sql` (`publication.autocreate.mode: disabled`),
+heartbeat every 60 s into `store.debezium_heartbeat` (dropped by the `Filter` before the EventRouter; Debezium's own
+records go to `__debezium-heartbeat.store`, auto-created with 1 partition), `snapshot.mode=never`.
 
-## Changing the outbox connector (adding a placed column)
+**Switching an existing stack** (the publication was created by Debezium's former `filtered` autocreate with every
+operation): run `store-outbox-cdc.sql` **first** (it `ALTER`s the publication to insert-only and adds the heartbeat table,
+in place: never drop it, the slot decodes with it), then **at once** `./kafka-connect/register-connectors.sh postgres-cdc`.
+The SQL must come first because the new heartbeat query needs the table and the precheck needs the new shape. Whether the
+old task, if it restarts in between, re-syncs the publication's table list (`filtered` mode) is not known: Verify (a)
+after the PUT shows it, and running the SQL again adds the heartbeat table back. Run the SQL **before** stores-service
+`V10` (or later) starts on a stack with this connector: from V10 on, stores-service deletes every outbox row (V10 the old
+ones, then each new one in its transaction); without the insert-only publication those DELETEs reach Debezium and only
+the EventRouter, untested here, would drop them.
+
+**Privileges** (a dedicated user instead of `postgres`): REPLICATION, CONNECT on DB `store`, USAGE on schema `store`,
+SELECT on `outbox_events` and `debezium_heartbeat`, INSERT and DELETE on `debezium_heartbeat`, USAGE on
+`store.debezium_heartbeat_id_seq`. Ownership of the publication is not needed (autocreate disabled).
+
+### Verify postgres-cdc
+
+Run from `docker/` in bash or zsh, in one terminal (the functions only exist in the shell they were pasted into):
+
+```bash
+unalias ktopics psql_store toffsets 2>/dev/null
+ktopics() { docker exec -e JMX_PORT= -e KAFKA_JMX_OPTS= kafka kafka-topics --bootstrap-server kafka:29092 "$@"; }
+psql_store() { docker exec -i postgres psql -U postgres -d store "$@"; }
+toffsets() { docker exec -e JMX_PORT= -e KAFKA_JMX_OPTS= kafka kafka-run-class kafka.tools.GetOffsetShell \
+  --bootstrap-server kafka:29092 --topic "$1" | awk -F: '{s+=$3} END {print s+0}'; }
+```
+
+a. After the PUT, publication shape — one row `t t f f f`, tables `debezium_heartbeat` and `outbox_events`:
+   `psql_store -c "SELECT pubinsert, NOT puballtables, pubupdate, pubdelete, pubtruncate FROM pg_publication WHERE pubname = 'debezium_store_v2_publication';"`
+   and `psql_store -c "SELECT schemaname, tablename FROM pg_publication_tables WHERE pubname = 'debezium_store_v2_publication' ORDER BY 2;"`.
+b. First start of a stores-service with `V10` (deletes the old rows): note `toffsets ProductCreated` and
+   `toffsets ProductUpdated` before, start it, check both again — **unchanged** (no delete event, no tombstone).
+c. Create a product with `-H 'X-Request-Id: verify-2'`: `ProductCreated` grows by **1**;
+   `docker exec -e JMX_PORT= -e KAFKA_JMX_OPTS= kafka kafka-console-consumer --bootstrap-server kafka:29092 --topic ProductCreated --from-beginning --property print.headers=true --timeout-ms 10000 | tail -1`
+   shows `id:<x>,correlationContext:{"requestId": "verify-2"}` and a payload with `"eventId": "<x>"` (the same value);
+   inventory-service logs the consumer lines with `requestId=verify-2`; `psql_store -tAc "SELECT count(*) FROM store.outbox_events"` is `0`.
+d. Update that product with a SKU price `120000.00`: `ProductUpdated` grows by 1 and its payload shows the price as `120000`.
+e. Excel import of two products: `ProductCreated` grows by **2**.
+f. Heartbeat: `L=$(psql_store -tAc "SELECT pg_current_wal_lsn()")`, then poll for up to 5 minutes
+   `psql_store -tAc "SELECT confirmed_flush_lsn > '$L' FROM pg_replication_slots WHERE slot_name = 'debezium_store_v2_slot'"`
+   until `t`; `psql_store -tAc "SELECT now() - max(beat_at) < interval '2 minutes' FROM store.debezium_heartbeat"` is `t`;
+   `ktopics --list | grep -E 'debezium_heartbeat|__debezium-heartbeat'` shows `__debezium-heartbeat.store`
+   and no `store.store.debezium_heartbeat`; `curl -s localhost:9084/connectors/postgres-cdc/status` — `RUNNING`.
+g. Optional, one transaction for the product and its event: create a temporary slot
+   `psql_store -c "SELECT pg_create_logical_replication_slot('verify_xid', 'test_decoding')"`, create one product, then
+   `psql_store -c "SELECT xid, data FROM pg_logical_slot_peek_changes('verify_xid', NULL, NULL) WHERE data ~ 'store_products|outbox_events' "`
+   — the `store_products` INSERT and the `outbox_events` INSERT and DELETE have the same `xid`. Then
+   `psql_store -c "SELECT pg_drop_replication_slot('verify_xid')"` (**always**: an unused slot keeps WAL).
+
+### Runbook (postgres-cdc)
+
+The inventory runbook below applies with `store` / `debezium_store_v2_slot` / `debezium_store_v2_publication`
+(slot lag, heartbeat, FAILED task, never drop the publication, dropping the database). Specific to the catalog:
+- **Slot lost or recreated**: the `ProductCreated` / `ProductUpdated` written in the gap are gone for good (the outbox is
+  empty; no resync tool, oms-workspace open question 40). Note the window, in the same time base as
+  `store.store_products.created_at` / `updated_at` (`TIMESTAMP` without time zone, like `installed_on` below). Find the
+  products created or updated in it (`SELECT id, store_id FROM store.store_products WHERE updated_at BETWEEN … OR
+  created_at BETWEEN …`). A plain re-save publishes nothing when nothing changed (stores-service skips an unchanged
+  update), so give each product a real change and revert it: two `ProductUpdated` with higher versions; inventory applies
+  the newer one and creates missing rows from a `ProductUpdated`, which also covers a lost `ProductCreated`.
+
+### First application (postgres-cdc, insert-only + heartbeat)
+
+Not applied yet. Fill in after the run: date, versions, results of a–g.
+
+## Changing an outbox connector (adding a placed column)
 
 The `EventRouter` reads every `table.fields.additional.placement` column from each change event. Change events written
 before the column existed do not have it, and the task is **expected** to fail on them (all events stop until rollback;
-nothing is lost, rows wait in the outbox). So apply the new config only once the connector has read every change event
-written before the migration. Run the commands from `docker/`.
+nothing is lost, the slot keeps the WAL). So apply the new config only once the connector has read every change event
+written before the migration. The outbox tables are always empty, so the check is by **WAL position** (example for
+stores-service; for inventory use DB `inventory` and `debezium_inventory_slot`). Run from `docker/`.
 
-1. Deploy stores-service with the migration (e.g. `V9`) and keep the current connector running.
-2. Note when the migration ran:
-   `docker exec -it postgres psql -U postgres -d store -c "SELECT version, installed_on FROM store.flyway_schema_history WHERE version = '9';"`
-   (drop `store.` if the table is in another schema). `installed_on` is in the database session's local time, while
-   `outbox_events.created_at` is written in UTC: convert before comparing (e.g. `22:16` in UTC+7 is `15:16` UTC).
-3. Create or update one product **after** that time (an update must change a field, otherwise nothing is written).
-4. Check that this newest outbox row has the column and that the current connector has published it:
-   - `docker exec -it postgres psql -U postgres -d store -c "SELECT event_type, created_at, correlation_context FROM store.outbox_events ORDER BY created_at DESC LIMIT 3;"`
-     — the newest row is after the migration and its `correlation_context` is not `{}` (rows from before the migration
-     show the default `{}`);
-   - the record is on its topic (`ProductCreated` or `ProductUpdated`, consumer command in **Verify**, without the header
-     check).
+1. Deploy the service with the migration (e.g. stores-service `V9`) and keep the current connector running.
+2. Right after the migration, before any new event: `docker exec -it postgres psql -U postgres -d store -c "SELECT pg_current_wal_lsn();"`.
+   A position taken later is past every event and is only reached by events written after it. (To check when a migration
+   ran: `SELECT version, installed_on FROM store.flyway_schema_history WHERE version = '9';` — `installed_on` is in the
+   database session's local time.)
+3. Wait until `SELECT confirmed_flush_lsn >= '<lsn>' FROM pg_replication_slots WHERE slot_name = 'debezium_store_v2_slot';`
+   returns `t`. The heartbeat moves the slot every minute (plus the offset flush, 60 s by default) without any product
+   write. `confirmed_flush_lsn` only moves to the last event the connector has processed, never to
+   `pg_current_wal_lsn()`, so never compare with the current position.
+4. `./kafka-connect/register-connectors.sh postgres-cdc`
+5. **Verify** the connector.
 
-   Debezium reads the outbox in WAL order, so once it has published a row written after the migration it has also read
-   every change event before it: none without the column is left to read.
-5. `./kafka-connect/register-connectors.sh postgres-cdc`
-6. **Verify.**
+First application (2026-11-04, local stack, Debezium 2.2.1, before the delete-after-insert outbox): applied after V9 by
+checking the newest outbox row; the task stayed `RUNNING`, the header reached `ProductCreated` and inventory-service logged
+the same `requestId`. Whether the task really fails on a pre-migration event was not tested.
 
-Alternative to step 4, by WAL position (slot `debezium_store_v2_slot`):
-- record `SELECT pg_current_wal_lsn();` **right after** the migration, before any new outbox row; a position taken later
-  is past every event and is only reached by events written after it;
-- after writing a product, wait at least `offset.flush.interval.ms` (60 s by default):
-  `SELECT confirmed_flush_lsn >= '<lsn>' FROM pg_replication_slots WHERE slot_name = 'debezium_store_v2_slot';` must
-  return `t`. `confirmed_flush_lsn` only moves to the last event the connector has processed, never to
-  `pg_current_wal_lsn()`, so never compare with the current position.
-
-First application (2026-11-04, local stack, Debezium 2.2.1): applied after V9 with the step 4 check; the task stayed
-`RUNNING`, the header reached `ProductCreated` and inventory-service logged the same `requestId`. Whether the task
-really fails on a pre-migration event was not tested.
-
-**Rollback:** restore the previous `connectors/postgres-cdc.json` (git), run the script again, and restart the task if it
-stays `FAILED` (`curl -X POST localhost:9084/connectors/postgres-cdc/tasks/0/restart`). The old config ignores the column.
-
-## Verify
-
-1. Create or update one product (with `-H 'X-Request-Id: verify-1'` to follow it).
-2. `curl -s localhost:9084/connectors/postgres-cdc/status` — connector and task still `RUNNING`.
-3. The record has the header (the env overrides stop the CLI from binding the broker's JMX port):
-   `docker exec -e JMX_PORT= -e KAFKA_JMX_OPTS= kafka kafka-console-consumer --bootstrap-server kafka:29092 --topic ProductCreated --from-beginning --property print.headers=true --timeout-ms 10000`
-   shows `correlationContext:{"requestId":"verify-1"}` on the new record.
-4. inventory-service logs the consumer lines with `requestId=verify-1`.
+**Rollback:** restore the previous `connectors/<name>.json` (git), run the script again, and restart the task if it stays
+`FAILED` (`curl -X POST localhost:9084/connectors/<name>/tasks/0/restart`). The old config ignores the column.
 
 ## `inventory-outbox-cdc` (inventory-service outbox, ADR 0006)
 
 inventory-service writes each stock reply to `inventory.outbox_events` with `id` = the payload `eventId` and **deletes
 the row in the same transaction** (oms-workspace open question 19): the table is always empty and the INSERT reaches
 Kafka only through the WAL. Same EventRouter settings as `postgres-cdc` (topic = `event_type`, key = `aggregate_id`
-= orderId, header `id` = `eventId`, header `correlationContext`). What differs:
+= orderId, header `id` = `eventId`, header `correlationContext`). The settings below (insert-only publication,
+heartbeat, privileges) are shared by both connectors; specific to inventory are the pre-created topics:
 
 - **Insert-only publication**, created by `kafka-connect/sql/inventory-outbox-cdc.sql` (`publication.autocreate.mode:
   disabled`): pgoutput never sends the DELETEs, so no delete event reaches the EventRouter and no tombstone can be
@@ -218,6 +267,8 @@ The two verify records stay in `StockReservationExpired` for 14 days with unknow
   the cause (or restore the previous `connectors/inventory-outbox-cdc.json` from git and re-run the script), then
   `curl -X POST localhost:9084/connectors/inventory-outbox-cdc/tasks/0/restart`.
 - **Never drop or recreate `debezium_inventory_publication`** while the slot exists: decoding older WAL then fails.
+  A repair is done in place with `ALTER PUBLICATION` (pgoutput picks it up at the ALTER's commit; changes before it keep
+  the old settings), as `sql/store-outbox-cdc.sql` does for the store publication.
   Never delete the connector (offsets). To drop DB `inventory`, drop the slot first (Postgres refuses otherwise). The
   slot is in use while Kafka Connect runs (pausing the connector keeps the connection), so stop Connect first:
   `docker compose stop kafka-connect` (this also pauses `postgres-cdc`; its slot keeps stores-service's events), then

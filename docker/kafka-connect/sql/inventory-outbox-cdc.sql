@@ -45,7 +45,7 @@ BEGIN
     END IF;
 
     IF NOT (pub.pubinsert AND NOT pub.pubupdate AND NOT pub.pubdelete AND NOT pub.pubtruncate) OR pub.puballtables THEN
-        RAISE EXCEPTION 'debezium_inventory_publication exists but is not insert-only on listed tables; it must not be altered while the slot exists (docs/connectors.md, runbook)';
+        RAISE EXCEPTION 'debezium_inventory_publication exists but is not insert-only on listed tables; repair it by hand with ALTER PUBLICATION, never drop or recreate it while the slot exists (docs/connectors.md, runbook)';
     END IF;
     SELECT array_agg(schemaname || '.' || tablename ORDER BY schemaname, tablename) INTO tabs
     FROM pg_publication_tables WHERE pubname = 'debezium_inventory_publication';
