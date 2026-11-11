@@ -33,6 +33,76 @@ tables are always empty, the INSERT reaches Kafka only through the WAL, and the 
 DELETEs (`tombstones.on.delete=false` and the EventRouter, which ignores DELETE operations on an outbox, are the second
 and third guard). Consequence: a lost or recreated slot loses the events of the gap for good (runbooks below).
 
+## WAL, replication slots and the heartbeat
+
+Read this before the runbooks: it explains why a stopped or idle connector can fill the Postgres disk.
+An **LSN** (log sequence number) is a position in the WAL, e.g. `0/11EBA780`. The times below stand in for LSNs.
+
+**The big picture first.**
+- **One WAL per Postgres server.** The WAL (write-ahead log, `pg_wal/`) is the server's journal of every change, for
+  every database on it. Locally one `postgres` container holds DB `store` and DB `inventory`, so both write to the same
+  WAL. Postgres uses it for crash recovery, replicas, point-in-time restore, and logical decoding (Debezium).
+- **Many slots, each with its own positions.** A server can have several replication slots (`max_replication_slots`, 10
+  in `docker-compose.yml`), one per reader. Locally there are two: `debezium_store_v2_slot` (DB `store`) and
+  `debezium_inventory_slot` (DB `inventory`); a physical replica configured with `primary_slot_name` would add a third.
+  A logical slot has two positions:
+  - `confirmed_flush_lsn`: what its reader reported as done ("done up to X", sent over its replication connection).
+    Postgres never guesses it.
+  - `restart_lsn`: where decoding would have to restart. Postgres derives it from the reported position and from the
+    transactions still open, so it is at or behind `confirmed_flush_lsn`. A long-running transaction keeps it back.
+- **WAL is freed only at a checkpoint, and only up to the oldest `restart_lsn`.** A checkpoint (every
+  `checkpoint_timeout`, 5 minutes by default, or earlier when `max_wal_size` is reached) writes the changed pages to the
+  table files. WAL files before its redo point are then recycled, but never past the oldest `restart_lsn` of all slots,
+  past WAL not yet archived, or inside `wal_keep_size`. A slot can only make Postgres keep WAL **longer**. It can never
+  make Postgres drop WAL that crash recovery still needs, so no committed data is lost.
+
+  ```
+  slot                       reader                 receives                            restart_lsn
+  replica_1 (example)        physical replica       all WAL                             17:00
+  debezium_inventory_slot    inventory-outbox-cdc   INSERTs of its publication only     16:59
+  debezium_store_v2_slot     postgres-cdc           INSERTs of its publication only     09:00  ← oldest
+  → the checkpoint may recycle only WAL before 09:00, for the whole server
+  ```
+
+**Why a Debezium slot stops.** A logical slot sends Debezium only the changes of the tables in its publication
+(insert-only here). Changes to every other table and database are still written to the WAL. The decoding reads past
+them (other databases are skipped, other tables are filtered by the publication), and since Postgres 15 transactions
+that touch no published table are not sent at all. Debezium reports a position only for a record it has processed:
+Kafka Connect commits the offset (every 60 s by default) and Debezium then tells Postgres the LSN. So with no INSERT
+into the outbox, Debezium has nothing to report, and the slot stays where the last event was. It becomes the oldest
+slot and holds the WAL of the **whole server**, including inventory's and every other write, until the next outbox
+INSERT. Then it jumps forward in one step; nothing is reprocessed, because the decoding had been reading the WAL all
+along. What goes wrong during the wait:
+- the disk fills;
+- a connector restart re-reads the whole held range;
+- the slot also holds back `catalog_xmin`, so VACUUM cannot clean the system catalogs;
+- "connector dead" cannot be told from "no events".
+
+A physical replica, while connected, receives all WAL, so its position keeps moving. On 2026-11-09, before the store
+heartbeat existed, query (g) showed `debezium_store_v2_slot` 582 kB behind, while `debezium_inventory_slot`, which
+already had its heartbeat, was 1832 bytes behind.
+
+**What the heartbeat does.** Every `heartbeat.interval.ms` (60 s) Debezium runs `heartbeat.action.query`: one statement
+that INSERTs a row into `<schema>.debezium_heartbeat` (a table in the same publication as the outbox) and deletes rows
+older than one hour. The INSERT reaches Debezium, the `dropHeartbeat` Filter drops it before the EventRouter, the offset
+is committed, and the slot moves forward. With a 60 s heartbeat and a 60 s offset flush, it moves about once a minute
+and trails by up to about two minutes; in both *First application* runs the check passed after about 2.5 minutes. WAL
+is then kept only for the last few minutes. The same interval also writes Debezium's own record `{"ts_ms": …}` to
+`__debezium-heartbeat.<topic.prefix>`. That record is built into Debezium and exists only when `heartbeat.interval.ms`
+is above 0. It is not the table's row, and no service reads it.
+
+**What it does not do.**
+- It does not touch business tables or block queries, and it does not affect backups, replicas or crash recovery. Its
+  cost is one small statement a minute per database, on a table of about 60 rows.
+- **When the connector stops, the heartbeat stops too**, and the slot holds WAL again until the connector runs.
+- **When the heartbeat query fails**, Debezium 2.2 is expected to only log most such failures, and the task stays
+  `RUNNING` while the slot stalls (runbook *Task RUNNING does not prove the heartbeat*).
+
+For both cases: alert on WAL kept (`restart_lsn`, query (g)), `wal_status` and `max(beat_at)`, and size
+`max_slot_wal_keep_size` (oms-workspace open question 55). A slot that exceeds that limit is invalidated
+(`wal_status` `lost`): the task is expected to fail, and the slot must be dropped and recreated, losing the events of the gap
+(runbooks below).
+
 ## First setup, and after a Kafka reset
 
 The connectors' configs, offsets and status live in Kafka topics (`_connect_*`, kept in the `kafka_data` volume,
@@ -43,7 +113,8 @@ them. Run from `docker/`, in this order:
 # 1. stores-service (Flyway V9 or later) and inventory-service (Flyway V5) started once.
 # 2. topics with their partitions, before anything can auto-create them (idempotent)
 ./kafka/create-topics.sh
-# 3. publications + heartbeat tables (once per database; idempotent, refuse before V9 / V5)
+# 3. publications + heartbeat tables (once per database; idempotent, refuse before V9 / V5;
+#    why the heartbeat: "WAL, replication slots and the heartbeat" above)
 docker exec -i postgres psql -1 -v ON_ERROR_STOP=1 -U postgres -d store -f - < kafka-connect/sql/store-outbox-cdc.sql
 docker exec -i postgres psql -1 -v ON_ERROR_STOP=1 -U postgres -d inventory -f - < kafka-connect/sql/inventory-outbox-cdc.sql
 # 4. connectors (every one is attempted; exits non-zero if any is not RUNNING or its publication has the wrong shape)
@@ -195,14 +266,11 @@ heartbeat, privileges) are shared by both connectors; specific to inventory are 
   disabled`): pgoutput never sends the DELETEs, so no delete event reaches the EventRouter and no tombstone can be
   produced. The script refuses to run before inventory-service's V5: inventory-service uses Flyway's
   `baseline-on-migrate`, and a table created in a schema Flyway has not migrated yet would make it skip V1.
-- **Heartbeat**: the publication holds only the outbox, so changes to the other inventory tables are not streamed and
-  the slot would not advance between replies (WAL kept). Every 60 s Debezium runs `heartbeat.action.query`, which
-  inserts a row into `inventory.debezium_heartbeat` and prunes rows older than one hour in the same statement. The
-  INSERT is streamed, a `Filter` transform drops it (predicate `isHeartbeatTable`), the EventRouter only handles the
-  outbox topic (predicate `isOutbox`), and the offset still moves the slot. Debezium's own heartbeat records go to the
-  technical topic `__debezium-heartbeat.inventory` (created by `topic.creation.default.*`, so also 6 partitions and 14
-  days; harmless). `debezium_heartbeat` is a table of the connector, not of the
-  domain: no merchant data, not managed by Flyway.
+- **Heartbeat** (why and how: *WAL, replication slots and the heartbeat* above): every 60 s into
+  `inventory.debezium_heartbeat` (pruned to one hour), dropped by the `Filter` (predicate `isHeartbeatTable`) before
+  the EventRouter (predicate `isOutbox`). Debezium's own records go to `__debezium-heartbeat.inventory` (created by
+  `topic.creation.default.*`, so 6 partitions and 14 days; harmless). `debezium_heartbeat` is a table of the
+  connector, not of the domain: no merchant data, not managed by Flyway.
 - **Topics** are pre-created by `kafka/create-topics.sh` (6 partitions, 14 days: local values; production sizing is
   open question 30 in oms-workspace); `topic.creation.default.*` on the connector is only a safety net.
 - **Privileges** (a dedicated user instead of `postgres`): REPLICATION, CONNECT on DB `inventory`, USAGE on schema
@@ -265,7 +333,7 @@ f. Heartbeat: optionally change a non-outbox row (writes WAL the publication doe
    `inventory.inventory.debezium_heartbeat`; after an hour the table holds about 60 rows or fewer.
 g. Slot health (also the runbook query):
    ```bash
-   psql_inv -c "SELECT slot_name, active, wal_status, confirmed_flush_lsn, pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)) AS behind FROM pg_replication_slots;"
+   psql_inv -c "SELECT slot_name, active, wal_status, confirmed_flush_lsn, pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)) AS behind, pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS wal_kept FROM pg_replication_slots;"
    ```
 
 The two verify records stay in `StockReservationExpired` for 14 days with unknown orderIds: order-service's consumer
@@ -273,7 +341,7 @@ The two verify records stay in `StockReservationExpired` for 14 days with unknow
 
 ### Runbook (inventory-outbox-cdc)
 
-- **WAL kept / slot lag**: query (g). A stopped or failed connector keeps WAL on DB `inventory` until it runs again;
+- **WAL kept / slot lag**: query (g) (`wal_kept` is what the slot holds; `behind` is what the connector has not confirmed). A stopped or failed connector keeps the WAL of the **whole server** (every database) until it runs again (*WAL, replication slots and the heartbeat*);
   `max_slot_wal_keep_size` is unlimited by default, so a long outage can fill the disk. `wal_status` `extended` or
   `unreserved` means act now.
 - **Task RUNNING does not prove the heartbeat**: Debezium 2.2 is expected to only log most failures of
@@ -307,10 +375,11 @@ SQL script, `create-topics.sh` and `register-connectors.sh` as in *First setup*;
   `id` = eventId and `correlationContext:{"requestId": "verify-outbox-1"}`; JSONB normalises the spacing and the
   payload's key order; no tombstone or delete event.
 - e. connector and task still `RUNNING`; `outbox_events` count `0`.
-- f. `confirmed_flush_lsn` passed `L` within about 3 minutes (first poll `f` at 21:04:30, `t` at 21:07:01; heartbeat
+- f. `confirmed_flush_lsn` passed `L` within about 2.5 minutes (first poll `f` at 21:04:30, `t` at 21:07:01; heartbeat
   60 s + offset flush 60 s); `max(beat_at)` fresh, 4 rows; of the heartbeat topics only `__debezium-heartbeat.inventory`
   exists, no `inventory.inventory.debezium_heartbeat`.
-- g. `debezium_inventory_slot` active, `reserved`, 1832 bytes behind.
+- g. `debezium_inventory_slot` active, `reserved`, 1832 bytes behind; `debezium_store_v2_slot` (no heartbeat yet) active,
+  `reserved`, 582 kB behind.
 
 The condition of open question 19 (one record per reply, no tombstone, task RUNNING) holds locally. **Not tested:** a
 failing heartbeat query (runbook), and the behaviour after a Kafka or Connect restart.
