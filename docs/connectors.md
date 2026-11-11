@@ -136,7 +136,25 @@ The inventory runbook below applies with `store` / `debezium_store_v2_slot` / `d
 
 ### First application (postgres-cdc, insert-only + heartbeat)
 
-Not applied yet. Fill in after the run: date, versions, results of a–g.
+2026-11-11, local stack (Debezium 2.2.1 on cp-kafka-connect 7.3.0, Postgres 16, macOS, zsh), with this branch and
+stores-service#59. Existing stack: the publication had been created by the former `filtered` autocreate.
+
+- SQL (*Switching an existing stack*) and `register-connectors.sh postgres-cdc`, then (a) publication shape: reported by
+  the user as expected; output not recorded. Indirect evidence: the script's precheck refused the PUT unless the publication
+  was insert-only with exactly both tables at the PUT, and step f shows the new config (heartbeat) running.
+- b. before stores-service V10: `ProductCreated` 1, `ProductUpdated` 2, `store.outbox_events` 24 rows; after the start
+  with V10 and steps c and d: 2 and 3, outbox `0`. V10 added no record: derived from these totals and the deltas of c
+  and d (+1 each); the counts were not re-read between V10 and c.
+- c. product created with `X-Request-Id: verify-2`: `ProductCreated` delta **1**; header
+  `id:013be7c5-…` = payload `"eventId": "013be7c5-…"` (open question 45 fixed), `correlationContext:{"requestId": "verify-2"}`;
+  outbox count `0`. The inventory-service log lines with `requestId=verify-2` were not recorded.
+- d. update with price `120000.00`: response `version` 1, `ProductUpdated` delta 1, published price `120000` (`grep -o 'price[^,]*'`
+  printed `price\": 120000`, the match ends at the comma, so no `.00`).
+- f. `confirmed_flush_lsn` passed `L` within about 2.5 minutes (first poll `f` at 18:58:40, `t` at 19:01:11); `max(beat_at)`
+  fresh; of the heartbeat topics only `__debezium-heartbeat.store` and `__debezium-heartbeat.inventory` exist, no
+  `store.store.debezium_heartbeat`; connector and task `RUNNING`.
+- **Not run:** e (Excel import), g (xid check), a failing heartbeat query, restarts. Whether the old task's `filtered`
+  mode would re-sync the table list was not observed (the PUT followed the SQL at once).
 
 ## Changing an outbox connector (adding a placed column)
 
