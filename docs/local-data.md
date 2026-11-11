@@ -2,7 +2,7 @@
 
 | Service | Data | Where it is kept |
 |---------|------|------------------|
-| postgres | databases `store`, `inventory`, Debezium's replication slots (`debezium_store_v2_slot`, `debezium_inventory_slot`), the publications and `inventory.debezium_heartbeat` | named volume `postgres_data` |
+| postgres | databases `store`, `inventory`, Debezium's replication slots (`debezium_store_v2_slot`, `debezium_inventory_slot`), the publications and the connectors' heartbeat tables (`store.debezium_heartbeat`, `inventory.debezium_heartbeat`) | named volume `postgres_data` |
 | zookeeper | Kafka cluster id, topic and broker metadata | named volumes `zookeeper_data`, `zookeeper_log` |
 | kafka | topics, consumer offsets, Kafka Connect's connector configs, offsets and status (`_connect_*`), Schema Registry's `_schemas` | named volume `kafka_data` |
 | redis | cache (append-only file) | named volume `redis_data` |
@@ -38,8 +38,8 @@ and Kafka Connect refuses to start (see *Kafka Connect exits after a Kafka reset
   Then start stores-service and inventory-service. Postgres keeps the slot, so nothing is published twice and nothing
   written meanwhile is lost (`docs/connectors.md`, *First setup, and after a Kafka reset*).
 - **Everything:** stop the services, `docker compose down -v`, then `docker compose up -d`, Terraform in `infra/local`,
-  and the connectors' first setup (`docs/connectors.md`: start inventory-service once, topics, publication SQL,
-  register).
+  and the connectors' first setup (`docs/connectors.md`: start stores-service and inventory-service once, topics, both
+  publication SQL files, register).
 
 ## Switching to these volumes (once)
 
@@ -65,11 +65,11 @@ Then start the services. The old anonymous volumes can be removed with `docker v
 
 ## Kafka Connect exits after a Kafka reset
 
-Symptoms: outbox rows are written but nothing reaches Kafka; the slot shows `active = f`; the connector is
+Symptoms: products or replies are written but nothing reaches Kafka; the slot shows `active = f`; the connector is
 `UNASSIGNED`, or `curl localhost:9084/...` hangs or answers nothing; `docker ps -a` shows `kafka-connect` as
 `Exited (1)` with `Topic '_connect_offsets' ... is required to have 'cleanup.policy=compact' ... found 'cleanup.policy=delete'`.
-Cause: a client kept running while Kafka was replaced (above). Nothing is lost: the rows stay in the outbox and the
-slot keeps the WAL. Fix, from `docker/`:
+Cause: a client kept running while Kafka was replaced (above). Nothing is lost: the outbox rows are already deleted,
+but the slots keep the WAL with their INSERTs, and the connectors publish them once they run again. Fix, from `docker/`:
 
 ```bash
 alias kt='docker exec -e JMX_PORT= -e KAFKA_JMX_OPTS= kafka kafka-topics --bootstrap-server kafka:29092'
