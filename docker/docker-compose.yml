@@ -165,6 +165,8 @@ services:
       - AWS_DEFAULT_REGION=eu-west-1
       - EDGE_PORT=4566
       - SERVICES=s3,dynamodb,sqs,events
+      # Check presigned URL signatures like AWS does (the default skips them): import uploads rely on it (BR-CAT-17)
+      - S3_SKIP_SIGNATURE_VALIDATION=0
     ports:
       - '4566-4597:4566-4597'
     volumes:

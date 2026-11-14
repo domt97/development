@@ -14,7 +14,7 @@ resources are defined today.
 | `docker/kafka-connect/connectors/*.json` | Connector configs: `postgres-cdc` (stores-service outbox), `inventory-outbox-cdc` |
 | `docker/kafka-connect/sql/*.sql` | Publications and heartbeat tables per database |
 | `docker/kafka-connect/register-connectors.sh` | Applies every connector config and waits until it is RUNNING |
-| `docker/infra/local/*.tf` | Terraform for LocalStack: S3 bucket, SQS queue, EventBridge rule and target |
+| `docker/infra/local/*.tf` | Terraform for LocalStack: S3 bucket (with browser-upload CORS and a lifecycle rule for uploaded import files), SQS queue, EventBridge rule and target |
 | `docs/connectors.md` | Connector setup, WAL and replication slots, verify steps, runbooks, how to change a connector |
 | `docs/local-data.md` | What survives a restart, how to reset, recovering Kafka Connect |
 
@@ -56,3 +56,8 @@ Say plainly which of these were run and which were not.
   services' Flyway migrations.
 - Topic sizes here (6 partitions, 14 days) are local values, not production sizing.
 - `localstack/localstack.sh` is not part of any setup step; Terraform creates the LocalStack resources.
+- The aws provider is pinned `< 5.86.0` (`main.tf`): newer versions never finish creating the bucket lifecycle rule against
+  LocalStack 3.8.1. Lift the pin only together with a LocalStack upgrade, after `terraform apply` twice gives an empty second plan.
+- `S3_SKIP_SIGNATURE_VALIDATION=0` (compose) makes LocalStack check presigned URLs; ordinary signed requests are still not
+  checked. A real environment needs its own bucket CORS origins, the lifecycle rule and the signer's IAM
+  (`docs/local-data.md`, *LocalStack*).

@@ -91,4 +91,21 @@ keeps its old log: always read it with `--since`, or an old "Kafka Connect start
 ## LocalStack
 
 The community image keeps nothing: after LocalStack restarts, run `terraform apply` in `docker/infra/local` to recreate
-the bucket, queue and schedule (objects uploaded to S3 are gone).
+the bucket (with its CORS and lifecycle rules), queue and schedule (objects uploaded to S3 are gone).
+
+After pulling a change to the LocalStack environment or the Terraform provider pin (e.g. `S3_SKIP_SIGNATURE_VALIDATION`,
+`< 5.86.0`): `docker compose up -d localstack` (recreates the container: S3 objects are lost), then in
+`docker/infra/local` `terraform init -upgrade` (the lock file changed) and `terraform apply`.
+
+**Product import files** (BR-CAT-16, BR-CAT-17) live in `localdev-store-products` at `{merchantId}/{storeId}/imports/{fileName}`.
+
+- **From the browser.** oms-web (origins in `web_origins`, default `http://localhost:5173` and `http://127.0.0.1:5173`)
+  uploads straight to `http://localhost:4566/localdev-store-products/…` with a presigned PUT from stores-service. Compose
+  sets `S3_SKIP_SIGNATURE_VALIDATION=0`, so LocalStack checks those URLs as AWS does: a wrong size, content type or tag,
+  another key, a changed or expired URL → 403. Without it LocalStack accepts any presigned request.
+- **By hand.** Ordinary aws CLI requests are not signature-checked locally (the keys are not checked), but the CLI needs
+  some keys and a region:
+  `AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_DEFAULT_REGION=eu-west-1 aws --endpoint-url http://localhost:4566 s3 cp products.xlsx s3://localdev-store-products/<merchantId>/<storeId>/imports/products.xlsx`.
+- **Cleanup.** Uploaded files carry the tag `purpose=import-upload`, and the lifecycle rule `expire-import-uploads` deletes
+  them after `import_upload_retention_days` (7). Files copied by hand have no tag and are kept. LocalStack stores the rule;
+  whether the community image actually expires objects is not verified, so do not rely on it locally.
