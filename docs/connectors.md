@@ -257,7 +257,7 @@ the same `requestId`. Whether the task really fails on a pre-migration event was
 ## `inventory-outbox-cdc` (inventory-service outbox, ADR 0006)
 
 inventory-service writes each stock reply to `inventory.outbox_events` with `id` = the payload `eventId` and **deletes
-the row in the same transaction** (oms-workspace open question 19): the table is always empty and the INSERT reaches
+the row in the same transaction** (oms-workspace ADR 0006): the table is always empty and the INSERT reaches
 Kafka only through the WAL. Same EventRouter settings as `postgres-cdc` (topic = `event_type`, key = `aggregate_id`
 = orderId, header `id` = `eventId`, header `correlationContext`). The settings below (insert-only publication,
 heartbeat, privileges) are shared by both connectors; specific to inventory are the pre-created topics:
@@ -381,6 +381,6 @@ SQL script, `create-topics.sh` and `register-connectors.sh` as in *First setup*;
 - g. `debezium_inventory_slot` active, `reserved`, 1832 bytes behind; `debezium_store_v2_slot` (no heartbeat yet) active,
   `reserved`, 582 kB behind.
 
-The condition of open question 19 (one record per reply, no tombstone, task RUNNING) holds locally. **Not tested:** a
+The condition of ADR 0006 (one record per reply, no tombstone, task RUNNING) holds locally. **Not tested:** a
 failing heartbeat query (runbook), and the behaviour after a Kafka or Connect restart.
 
