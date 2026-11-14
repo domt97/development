@@ -28,7 +28,7 @@ CREATE TABLE IF NOT EXISTS inventory.debezium_heartbeat
 );
 
 -- 3. Insert-only publication: pgoutput never sends the outbox DELETEs (rows are deleted in the same transaction,
---    open question 19), the heartbeat prune, UPDATEs or TRUNCATEs. Debezium is configured with
+--    ADR 0006), the heartbeat prune, UPDATEs or TRUNCATEs. Debezium is configured with
 --    publication.autocreate.mode=disabled and uses exactly this publication.
 DO $$
 DECLARE
