@@ -4,7 +4,9 @@ terraform {
   required_providers {
     aws = {
       source  = "hashicorp/aws"
-      version = "~> 5.0"
+      # < 5.86.0: from 5.86.0 the provider never finishes creating aws_s3_bucket_lifecycle_configuration against
+      # LocalStack 3.8.1 (5.86.0 "inconsistent result after apply", 5.100.0 waits until its 3 min timeout); 5.85.0 works.
+      version = "~> 5.0, < 5.86.0"
     }
   }
 }
@@ -34,6 +36,45 @@ provider "aws" {
 
 resource "aws_s3_bucket" "store_products" {
   bucket = "${var.profile}-store-products"
+}
+
+# Browsers upload product import files straight to the bucket with a presigned PUT from stores-service (BR-CAT-17).
+# allowed_headers is "*" because LocalStack 3.8.1 rejects the browser's preflight list "content-type,x-amz-tagging"
+# (comma without a space) when the headers are named; the presigned signature still fixes the content type, length and
+# tag, and only these origins and PUT are allowed.
+resource "aws_s3_bucket_cors_configuration" "store_products" {
+  bucket = aws_s3_bucket.store_products.id
+
+  cors_rule {
+    allowed_origins = var.web_origins
+    allowed_methods = ["PUT"]
+    allowed_headers = ["*"]
+    expose_headers  = ["ETag"]
+    max_age_seconds = 3000
+  }
+}
+
+# Uploaded import files are deleted after var.import_upload_retention_days (BR-CAT-17). stores-service tags every
+# presigned upload purpose=import-upload; files copied by hand have no tag and are kept. A tag filter, not a prefix:
+# import files live at {merchantId}/{storeId}/imports/, which has no fixed prefix.
+resource "aws_s3_bucket_lifecycle_configuration" "store_products" {
+  bucket = aws_s3_bucket.store_products.id
+
+  rule {
+    id     = "expire-import-uploads"
+    status = "Enabled"
+
+    filter {
+      tag {
+        key   = "purpose"
+        value = "import-upload"
+      }
+    }
+
+    expiration {
+      days = var.import_upload_retention_days
+    }
+  }
 }
 
 # --------------------------------------------------
