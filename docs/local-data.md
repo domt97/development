@@ -2,7 +2,7 @@
 
 | Service | Data | Where it is kept |
 |---------|------|------------------|
-| postgres | databases `store`, `inventory`, Debezium's replication slots (`debezium_store_v2_slot`, `debezium_inventory_slot`), the publications and the connectors' heartbeat tables (`store.debezium_heartbeat`, `inventory.debezium_heartbeat`) | named volume `postgres_data` |
+| postgres | databases `store`, `inventory`, `cart`, `orders`, Debezium's replication slots (`debezium_store_v2_slot`, `debezium_inventory_slot`), the publications and the connectors' heartbeat tables (`store.debezium_heartbeat`, `inventory.debezium_heartbeat`) | named volume `postgres_data` |
 | zookeeper | Kafka cluster id, topic and broker metadata | named volumes `zookeeper_data`, `zookeeper_log` |
 | kafka | topics, consumer offsets, Kafka Connect's connector configs, offsets and status (`_connect_*`), Schema Registry's `_schemas` | named volume `kafka_data` |
 | redis | cache (append-only file) | named volume `redis_data` |
@@ -37,9 +37,10 @@ and Kafka Connect refuses to start (see *Kafka Connect exits after a Kafka reset
   ```
   Then start stores-service and inventory-service. Postgres keeps the slot, so nothing is published twice and nothing
   written meanwhile is lost (`docs/connectors.md`, *First setup, and after a Kafka reset*).
-- **Everything:** stop the services, `docker compose down -v`, then `docker compose up -d`, Terraform in `infra/local`,
-  and the connectors' first setup (`docs/connectors.md`: start stores-service and inventory-service once, topics, both
-  publication SQL files, register).
+- **Everything:** stop the services, `docker compose down -v`, then `docker compose up -d` (the empty volume creates
+  the databases again, `postgres/init/01-databases.sh`), Terraform in `infra/local`, and the connectors' first setup
+  (`docs/connectors.md`: topics first, then start stores-service and inventory-service once, both publication SQL files,
+  register).
 
 ## Switching to these volumes (once)
 

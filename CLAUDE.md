@@ -9,8 +9,9 @@ resources are defined today.
 
 | Path | Contains |
 |------|----------|
-| `docker/docker-compose.yml` | Kafka + Zookeeper, Kafka UI (8080), Schema Registry (9085), Kafka Connect with Debezium (9084), Postgres 16 (5432, DBs `store` and `inventory`), Redis (6379), LocalStack |
-| `docker/kafka/create-topics.sh` | Topics of the stock commands and replies (ADR 0006), with their partition count |
+| `docker/docker-compose.yml` | Kafka + Zookeeper, Kafka UI (8080), Schema Registry (9085), Kafka Connect with Debezium (9084), Postgres 16 (5432, DBs `store`, `inventory`, `cart`, `orders`), Redis (6379), LocalStack |
+| `docker/postgres/init/01-databases.sh` | Creates the service databases (`store`, `inventory`, `cart`, `orders`) on a fresh volume; idempotent, run it by hand on an existing one |
+| `docker/kafka/create-topics.sh` | Message topics with their partition count: stock commands and replies (ADR 0006), checkout (ADR 0007), `ProductCreated` / `ProductUpdated`; not the DLTs (services) or Debezium heartbeat topics |
 | `docker/kafka-connect/connectors/*.json` | Connector configs: `postgres-cdc` (stores-service outbox), `inventory-outbox-cdc` |
 | `docker/kafka-connect/sql/*.sql` | Publications and heartbeat tables per database |
 | `docker/kafka-connect/register-connectors.sh` | Applies every connector config and waits until it is RUNNING |
@@ -50,7 +51,7 @@ Say plainly which of these were run and which were not.
 ## Pitfalls
 
 - Secrets: only `docker/kafka-connect/secrets/*.example` is committed. Never commit a filled-in secrets file.
-- One Postgres server holds both databases, so they share one WAL: a stopped or idle connector keeps WAL from being
+- One Postgres server holds every service database (`store`, `inventory`, `cart`, `orders`), so they share one WAL: a stopped or idle connector keeps WAL from being
   removed and can fill the disk (`docs/connectors.md`, *WAL, replication slots and the heartbeat*).
 - `store.debezium_heartbeat` and `inventory.debezium_heartbeat` are created by the SQL scripts here, not by the
   services' Flyway migrations.

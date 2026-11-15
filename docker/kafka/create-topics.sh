@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# Creates the Kafka topics of the stock commands and replies (ADR 0006 in oms-workspace) before any producer or
-# connector needs them: a topic auto-created by the broker gets 1 partition, and adding partitions later moves keys
-# (orderId) to other partitions and breaks their order.
+# Creates the Kafka message topics (topic = message type, ADR 0002 in oms-workspace) before any producer or connector
+# needs them: a topic auto-created by the broker gets 1 partition, and adding partitions later moves keys (each
+# message's aggregate id: orderId, cartId, productId) to other partitions and breaks their order.
+# Not created here: the dead-letter topics <topic>.DLT (each consuming service creates its own) and the Debezium
+# heartbeat topics (created by Connect).
 #
 # Usage (from docker/, the stack running): ./kafka/create-topics.sh
 # Idempotent. For an existing topic: wrong partition count → error (never altered); other retention → set.
@@ -18,6 +20,12 @@ TOPICS=(
   StockReservationReleased StockReservationExpired
   # commands (order-service outbox; its connector is not built yet)
   ReserveStock ConfirmStockReservation ReleaseStockReservation
+  # checkout (ADR 0007), key cartId: command from cart-service's outbox, replies from order-service's outbox
+  # (their connectors come with those services)
+  PlaceCheckout CheckoutPlaced CheckoutRejected
+  # catalog, key productId (stores-service outbox, connector postgres-cdc). Older stacks have them auto-created with
+  # 1 partition: recreate them once (docs/connectors.md, *Recreate ProductCreated / ProductUpdated*).
+  ProductCreated ProductUpdated
 )
 
 # The env overrides stop the CLI from binding the broker's JMX port (JMX_PORT is set on the kafka container).
@@ -33,7 +41,8 @@ for topic in "${TOPICS[@]}"; do
     | sed -n 's/.*PartitionCount: *\([0-9]*\).*/\1/p' | head -1)
   if [[ "$partitions" != "$PARTITIONS" ]]; then
     echo "✗ $topic has $partitions partitions, expected $PARTITIONS." >&2
-    echo "  Never add partitions (keys would move). Locally: stop producers and consumers, then" >&2
+    echo "  Never add partitions (keys would move). Locally: stop its producers (the service, and Kafka Connect for outbox" >&2
+    echo "  topics) and consumers first (for ProductCreated / ProductUpdated follow docs/connectors.md, *Recreate*), then" >&2
     echo "  docker exec -e JMX_PORT= -e KAFKA_JMX_OPTS= kafka kafka-topics --bootstrap-server $BOOTSTRAP --delete --topic $topic" >&2
     echo "  wait a few seconds (the deletion is asynchronous), and run this script again." >&2
     failed=1
