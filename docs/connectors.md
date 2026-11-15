@@ -24,7 +24,7 @@ docker compose up -d --force-recreate kafka-connect
 
 | Connector | Database / table | Slot | Publication | Topics |
 |-----------|------------------|------|-------------|--------|
-| `postgres-cdc` | `store.outbox_events` (stores-service) + `store.debezium_heartbeat` | `debezium_store_v2_slot` | `debezium_store_v2_publication` (`sql/store-outbox-cdc.sql`, insert-only; first created by Debezium's former `filtered` autocreate) | `ProductCreated`, `ProductUpdated` (auto-created) |
+| `postgres-cdc` | `store.outbox_events` (stores-service) + `store.debezium_heartbeat` | `debezium_store_v2_slot` | `debezium_store_v2_publication` (`sql/store-outbox-cdc.sql`, insert-only; first created by Debezium's former `filtered` autocreate) | `ProductCreated`, `ProductUpdated` (pre-created; older stacks: *Recreate ProductCreated / ProductUpdated* below) |
 | `inventory-outbox-cdc` | `inventory.outbox_events` (inventory-service V5) + `inventory.debezium_heartbeat` | `debezium_inventory_slot` | `debezium_inventory_publication` (`sql/inventory-outbox-cdc.sql`, insert-only) | the stock replies of ADR 0006 (pre-created) |
 
 Both services insert each outbox row with `id` = the payload `eventId` and **delete it in the same transaction**
@@ -40,11 +40,13 @@ An **LSN** (log sequence number) is a position in the WAL, e.g. `0/11EBA780`. Th
 
 **The big picture first.**
 - **One WAL per Postgres server.** The WAL (write-ahead log, `pg_wal/`) is the server's journal of every change, for
-  every database on it. Locally one `postgres` container holds DB `store` and DB `inventory`, so both write to the same
-  WAL. Postgres uses it for crash recovery, replicas, point-in-time restore, and logical decoding (Debezium).
+  every database on it. Locally one `postgres` container holds the databases `store`, `inventory`, `cart` and `orders`,
+  so all write to the same WAL. Postgres uses it for crash recovery, replicas, point-in-time restore, and logical decoding (Debezium).
 - **Many slots, each with its own positions.** A server can have several replication slots (`max_replication_slots`, 10
   in `docker-compose.yml`), one per reader. Locally there are two: `debezium_store_v2_slot` (DB `store`) and
-  `debezium_inventory_slot` (DB `inventory`); a physical replica configured with `primary_slot_name` would add a third.
+  `debezium_inventory_slot` (DB `inventory`); cart-service and order-service will each add one with their connectors
+  (four on one WAL; one idle slot keeps the WAL of the whole server), and a physical replica configured with
+  `primary_slot_name` would add another.
   A logical slot has two positions:
   - `confirmed_flush_lsn`: what its reader reported as done ("done up to X", sent over its replication connection).
     Postgres never guesses it.
@@ -110,9 +112,13 @@ The connectors' configs, offsets and status live in Kafka topics (`_connect_*`, 
 them. Run from `docker/`, in this order:
 
 ```bash
-# 1. stores-service (Flyway V9 or later) and inventory-service (Flyway V5) started once.
-# 2. topics with their partitions, before anything can auto-create them (idempotent)
+# 0. the databases store, inventory, cart and orders. A fresh postgres_data volume creates them by itself
+#    (postgres/init/01-databases.sh); for an existing volume run it once (idempotent):
+docker exec -i postgres bash -s < postgres/init/01-databases.sh
+# 1. topics with their partitions, before anything can auto-create them (idempotent). Before the services: their
+#    listeners subscribe at start-up, and a subscription auto-creates a missing topic with 1 partition.
 ./kafka/create-topics.sh
+# 2. stores-service (Flyway V9 or later) and inventory-service (Flyway V5) started once.
 # 3. publications + heartbeat tables (once per database; idempotent, refuse before V9 / V5;
 #    why the heartbeat: "WAL, replication slots and the heartbeat" above)
 docker exec -i postgres psql -1 -v ON_ERROR_STOP=1 -U postgres -d store -f - < kafka-connect/sql/store-outbox-cdc.sql
@@ -123,8 +129,10 @@ curl -s localhost:9084/connectors
 ./kafka-connect/register-connectors.sh
 ```
 
-After a **Kafka reset** only steps 2 and 4 are needed (Postgres keeps the slots, the publications and the tables):
-step 2 **before** step 4, otherwise the first reply re-creates its topic with 1 partition.
+After a **Kafka reset** only steps 1 and 4 are needed (Postgres keeps the slots, the publications and the tables):
+step 1 **before** step 4 and before the services reconnect, otherwise a subscription or the first event (a stock reply, `ProductCreated`, `ProductUpdated`, a checkout
+message) re-creates its topic with 1 partition. The connectors of cart-service and order-service are added with those
+services; dead-letter topics (`<topic>.DLT`) are created by the consuming service, not by `create-topics.sh`.
 
 Then **Verify**. `snapshot.mode=never`: the connector never re-reads the table, it only streams the WAL from its
 replication slot:
@@ -134,6 +142,36 @@ replication slot:
   connectors before creating products (or give each product a real change later); for `inventory-outbox-cdc`, replies
   written before its slot exists are never published (only the expiry can write them today).
   (`snapshot.mode=never` is renamed `no_data` in later Debezium versions: check it on an upgrade.)
+
+## Recreate ProductCreated / ProductUpdated (once, older local stacks)
+
+On a stack older than `create-topics.sh` listing them, `ProductCreated` and `ProductUpdated` were auto-created with 1
+partition, and `./kafka/create-topics.sh` stops on them ("has 1 partitions, expected 6"). Recreate them once, **local
+only**, in this order so that no event is lost. From `docker/`:
+
+1. Stop stores-service, so no new event is written.
+2. Note `L=$(docker exec postgres psql -U postgres -d store -tAc "SELECT pg_current_wal_lsn()")` and wait until
+   `docker exec postgres psql -U postgres -d store -tAc "SELECT confirmed_flush_lsn > '$L' FROM pg_replication_slots WHERE slot_name = 'debezium_store_v2_slot'"`
+   prints `t` (the heartbeat moves it within a few minutes): every event is on Kafka.
+3. Wait until inventory has read them all: lag 0 for both groups, `product-consumer` (`ProductCreated`) and
+   `inventory-product-updated` (`ProductUpdated`):
+   `docker exec -e JMX_PORT= -e KAFKA_JMX_OPTS= kafka kafka-consumer-groups --bootstrap-server kafka:29092 --describe --group product-consumer`
+   (and the same for `inventory-product-updated`).
+4. Stop inventory-service and Kafka Connect (`docker compose stop kafka-connect`; this also pauses
+   `inventory-outbox-cdc`, which is harmless while inventory is stopped).
+5. Delete both topics
+   (`docker exec -e JMX_PORT= -e KAFKA_JMX_OPTS= kafka kafka-topics --bootstrap-server kafka:29092 --delete --topic ProductCreated`,
+   the same for `ProductUpdated`) and wait a few seconds (the deletion is asynchronous).
+6. `./kafka/create-topics.sh`: both now have 6 partitions.
+7. Start Kafka Connect (`docker compose start kafka-connect`), then inventory-service. **Before** starting
+   stores-service, check both groups with step 3's command while the new topics are still empty: no offsets, or
+   `CURRENT-OFFSET` `-`/0. Then start stores-service. The order matters: if a committed offset of the old topic survived
+   the delete, the reset to `earliest` for an out-of-range offset is safe only while the new topic is empty.
+
+Restarting is safe: inventory reads from the earliest offset (`auto-offset-reset: earliest`) and its per-product version
+gate makes a repeated event a no-op. Events are lost only if a step is skipped: an event published to an old topic but
+not yet consumed disappears with it (the outbox row is already deleted and the slot has moved on). Never do this in a
+shared environment: there, partitions are planned before the first event (open question 30).
 
 ## `postgres-cdc` (stores-service outbox)
 
