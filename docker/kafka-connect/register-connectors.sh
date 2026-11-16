@@ -70,6 +70,9 @@ precheck() {
     inventory-outbox-cdc)
       db=inventory; pub=debezium_inventory_publication; service="inventory-service once (Flyway V5)"
       tables="inventory.debezium_heartbeat,inventory.outbox_events"; sql=inventory-outbox-cdc.sql ;;
+    order-outbox-cdc)
+      db=orders; pub=debezium_orders_publication; service="order-service once (Flyway V1)"
+      tables="orders.debezium_heartbeat,orders.outbox_events"; sql=order-outbox-cdc.sql ;;
     postgres-cdc)
       db=store; pub=debezium_store_v2_publication; service="stores-service once (Flyway V9)"
       tables="store.debezium_heartbeat,store.outbox_events"; sql=store-outbox-cdc.sql ;;
@@ -88,6 +91,7 @@ hint() {
   case "$1" in
     postgres-cdc) echo "  Not proven yet: run 'Verify postgres-cdc' in docs/connectors.md." ;;
     inventory-outbox-cdc) echo "  Not proven yet: run 'Verify inventory-outbox-cdc' in docs/connectors.md." ;;
+    order-outbox-cdc) echo "  Not proven yet: run 'Verify order-outbox-cdc' in docs/connectors.md." ;;
     *) echo "  Not proven yet: produce one change event and re-check '$CONNECT_URL/connectors/$1/status'." ;;
   esac
 }

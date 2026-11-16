@@ -26,8 +26,9 @@ docker compose up -d --force-recreate kafka-connect
 |-----------|------------------|------|-------------|--------|
 | `postgres-cdc` | `store.outbox_events` (stores-service) + `store.debezium_heartbeat` | `debezium_store_v2_slot` | `debezium_store_v2_publication` (`sql/store-outbox-cdc.sql`, insert-only; first created by Debezium's former `filtered` autocreate) | `ProductCreated`, `ProductUpdated` (pre-created; older stacks: *Recreate ProductCreated / ProductUpdated* below) |
 | `inventory-outbox-cdc` | `inventory.outbox_events` (inventory-service V5) + `inventory.debezium_heartbeat` | `debezium_inventory_slot` | `debezium_inventory_publication` (`sql/inventory-outbox-cdc.sql`, insert-only) | the stock replies of ADR 0006 (pre-created) |
+| `order-outbox-cdc` | `orders.outbox_events` (order-service V1) + `orders.debezium_heartbeat` | `debezium_orders_slot` | `debezium_orders_publication` (`sql/order-outbox-cdc.sql`, insert-only) | `CheckoutRejected` today; `CheckoutPlaced` and the stock commands later (pre-created) |
 
-Both services insert each outbox row with `id` = the payload `eventId` and **delete it in the same transaction**
+All three services insert each outbox row with `id` = the payload `eventId` and **delete it in the same transaction**
 (inventory-service since inventory-service#40, stores-service since stores-service#59): the
 tables are always empty, the INSERT reaches Kafka only through the WAL, and the insert-only publications never send the
 DELETEs (`tombstones.on.delete=false` and the EventRouter, which ignores DELETE operations on an outbox, are the second
@@ -43,9 +44,9 @@ An **LSN** (log sequence number) is a position in the WAL, e.g. `0/11EBA780`. Th
   every database on it. Locally one `postgres` container holds the databases `store`, `inventory`, `cart` and `orders`,
   so all write to the same WAL. Postgres uses it for crash recovery, replicas, point-in-time restore, and logical decoding (Debezium).
 - **Many slots, each with its own positions.** A server can have several replication slots (`max_replication_slots`, 10
-  in `docker-compose.yml`), one per reader. Locally there are two: `debezium_store_v2_slot` (DB `store`) and
-  `debezium_inventory_slot` (DB `inventory`); cart-service and order-service will each add one with their connectors
-  (four on one WAL; one idle slot keeps the WAL of the whole server), and a physical replica configured with
+  in `docker-compose.yml`), one per reader. Locally there are three: `debezium_store_v2_slot` (DB `store`),
+  `debezium_inventory_slot` (DB `inventory`) and `debezium_orders_slot` (DB `orders`); cart-service will add one with
+  its connector (four on one WAL; one idle slot keeps the WAL of the whole server), and a physical replica configured with
   `primary_slot_name` would add another.
   A logical slot has two positions:
   - `confirmed_flush_lsn`: what its reader reported as done ("done up to X", sent over its replication connection).
@@ -118,11 +119,12 @@ docker exec -i postgres bash -s < postgres/init/01-databases.sh
 # 1. topics with their partitions, before anything can auto-create them (idempotent). Before the services: their
 #    listeners subscribe at start-up, and a subscription auto-creates a missing topic with 1 partition.
 ./kafka/create-topics.sh
-# 2. stores-service (Flyway V9 or later) and inventory-service (Flyway V5) started once.
+# 2. stores-service (Flyway V9 or later), inventory-service (Flyway V5) and order-service (Flyway V1) started once.
 # 3. publications + heartbeat tables (once per database; idempotent, refuse before V9 / V5;
 #    why the heartbeat: "WAL, replication slots and the heartbeat" above)
 docker exec -i postgres psql -1 -v ON_ERROR_STOP=1 -U postgres -d store -f - < kafka-connect/sql/store-outbox-cdc.sql
 docker exec -i postgres psql -1 -v ON_ERROR_STOP=1 -U postgres -d inventory -f - < kafka-connect/sql/inventory-outbox-cdc.sql
+docker exec -i postgres psql -1 -v ON_ERROR_STOP=1 -U postgres -d orders -f - < kafka-connect/sql/order-outbox-cdc.sql
 # 4. connectors (every one is attempted; exits non-zero if any is not RUNNING or its publication has the wrong shape)
 # an empty list means nothing is registered yet
 curl -s localhost:9084/connectors
@@ -131,8 +133,7 @@ curl -s localhost:9084/connectors
 
 After a **Kafka reset** only steps 1 and 4 are needed (Postgres keeps the slots, the publications and the tables):
 step 1 **before** step 4 and before the services reconnect, otherwise a subscription or the first event (a stock reply, `ProductCreated`, `ProductUpdated`, a checkout
-message) re-creates its topic with 1 partition. The connectors of cart-service and order-service are added with those
-services; dead-letter topics (`<topic>.DLT`) are created by the consuming service, not by `create-topics.sh`.
+message) re-creates its topic with 1 partition. The connector of cart-service is added with that service; dead-letter topics (`<topic>.DLT`) are created by the consuming service, not by `create-topics.sh`.
 
 Then **Verify**. `snapshot.mode=never`: the connector never re-reads the table, it only streams the WAL from its
 replication slot:
@@ -421,4 +422,61 @@ SQL script, `create-topics.sh` and `register-connectors.sh` as in *First setup*;
 
 The condition of ADR 0006 (one record per reply, no tombstone, task RUNNING) holds locally. **Not tested:** a
 failing heartbeat query (runbook), and the behaviour after a Kafka or Connect restart.
+
+## `order-outbox-cdc` (order-service outbox, ADR 0007)
+
+order-service writes each checkout reply to `orders.outbox_events` with `id` = the payload `eventId` and **deletes the
+row in the same transaction**, like the other two services. Same EventRouter settings (topic = `event_type`, key =
+`aggregate_id` = cartId for checkout replies, header `id` = `eventId`, header `correlationContext`), insert-only
+publication, heartbeat (`orders.debezium_heartbeat`, every 60 s, pruned to one hour, dropped by the `Filter`) and
+privileges as `inventory-outbox-cdc` above, with schema `orders`.
+
+- **Guard**: `kafka-connect/sql/order-outbox-cdc.sql` refuses to run until order-service's Flyway **V1** is applied (a
+  `flyway_schema_history` row with `version = '1'`). order-service has no `baseline-on-migrate`, but Flyway creates
+  schema `orders` and its history table at the first start, before any migration: the history table alone proves
+  nothing.
+- **Topics** `CheckoutRejected`, `CheckoutPlaced` (and later the stock commands) are pre-created by
+  `kafka/create-topics.sh`. `PlaceCheckout.DLT` is created by order-service when its listener is on.
+- The outbox has a scope column for the customer (checkout replies) and one for the merchant (stock commands, later);
+  neither is published.
+
+### Verify order-outbox-cdc
+
+order-service's PlaceCheckout listener is off by default (placement is not built yet). Turn it on for this check only,
+send a checkout for a merchant that does not exist (stores-service answers 404, so the reply is `INVALID_REQUEST` and
+no test data is created anywhere), and read the reply. From `docker/`, with stores-service running:
+
+```bash
+# order-service with the listener on (from repos/order-service): PLACE_CHECKOUT_ENABLED=true ./gradlew bootRun --args='--spring.profiles.active=localdev'
+CART=$(uuidgen | tr A-Z a-z); RID=verify-order-outbox-1
+MSG=$(python3 -c "
+import json,uuid,datetime
+now=datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+u=lambda: str(uuid.uuid4())
+print(json.dumps({'eventId':u(),'eventType':'PlaceCheckout','occurredAt':now,'customerId':u(),'cartId':'$CART',
+ 'cartVersion':1,'requestedAt':now,'delivery':{'address':{'line1':'1 Test St','city':'Test','country':'VN'},
+ 'recipientName':'Test','phone':'0900000000'},'stores':[{'merchantId':u(),'storeId':u(),'quoteId':u(),
+ 'lines':[{'lineId':u(),'productId':u(),'sku':'VERIFY-1','quantity':1}]}]}))")
+printf 'correlationContext:{"requestId":"%s"}\t%s\t%s\n' "$RID" "$CART" "$MSG" | docker exec -i -e JMX_PORT= -e KAFKA_JMX_OPTS= kafka \
+  kafka-console-producer --bootstrap-server kafka:29092 --topic PlaceCheckout --property parse.key=true \
+  --property parse.headers=true --property key.separator=$'\t' --property headers.delimiter=$'\t'
+# a few seconds later: one record, key = $CART, headers id + correlationContext with $RID, reason INVALID_REQUEST
+docker exec -e JMX_PORT= -e KAFKA_JMX_OPTS= kafka kafka-console-consumer --bootstrap-server kafka:29092 \
+  --topic CheckoutRejected --from-beginning --timeout-ms 8000 --property print.key=true --property print.headers=true | grep "$CART"
+docker exec postgres psql -U postgres -d orders -tAc "SELECT status FROM orders.checkouts WHERE cart_id = '$CART'"   # REJECTED
+```
+
+Then stop order-service and start it again without `PLACE_CHECKOUT_ENABLED`.
+
+### First application
+
+2026-11-16, local stack (Debezium Postgres connector 2.2.1 on cp-kafka-connect 7.3.0, Postgres 16, macOS, zsh).
+SQL script run twice (second run: no change), publication `t t f f f` on `orders.debezium_heartbeat` and
+`orders.outbox_events`; connector registered with a PUT of `connectors/order-outbox-cdc.json` (the publication shape
+checked by hand first, as `register-connectors.sh` does), `RUNNING` for 21 s, slot `debezium_orders_slot` active.
+The Verify above: one `CheckoutRejected`, key = cartId, headers `id` and `correlationContext` with the sent requestId,
+payload with `checkoutId` and `INVALID_REQUEST` on the store; row `REJECTED`. A broken record holding a phone number
+went to `PlaceCheckout.DLT` and the phone was in no log line. The guard refused an empty database and one with a history
+table but no V1 (temporary container). **Not tested:** `register-connectors.sh` itself for this connector (the running
+stack mounts its secrets from another checkout), and the behaviour after a Kafka or Connect restart.
 
