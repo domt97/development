@@ -12,7 +12,7 @@ resources are defined today.
 | `docker/docker-compose.yml` | Kafka + Zookeeper, Kafka UI (8080), Schema Registry (9085), Kafka Connect with Debezium (9084), Postgres 16 (5432, DBs `store`, `inventory`, `cart`, `orders`), Redis (6379), LocalStack |
 | `docker/postgres/init/01-databases.sh` | Creates the service databases (`store`, `inventory`, `cart`, `orders`) on a fresh volume; idempotent, run it by hand on an existing one |
 | `docker/kafka/create-topics.sh` | Message topics with their partition count: stock commands and replies (ADR 0006), checkout (ADR 0007), `ProductCreated` / `ProductUpdated`; not the DLTs (services) or Debezium heartbeat topics |
-| `docker/kafka-connect/connectors/*.json` | Connector configs: `postgres-cdc` (stores-service outbox), `inventory-outbox-cdc` |
+| `docker/kafka-connect/connectors/*.json` | Connector configs: `postgres-cdc` (stores-service outbox), `inventory-outbox-cdc`, `order-outbox-cdc` |
 | `docker/kafka-connect/sql/*.sql` | Publications and heartbeat tables per database |
 | `docker/kafka-connect/register-connectors.sh` | Applies every connector config and waits until it is RUNNING |
 | `docker/infra/local/*.tf` | Terraform for LocalStack: S3 bucket (with browser-upload CORS and a lifecycle rule for uploaded import files), SQS queue, EventBridge rule and target |
@@ -53,7 +53,7 @@ Say plainly which of these were run and which were not.
 - Secrets: only `docker/kafka-connect/secrets/*.example` is committed. Never commit a filled-in secrets file.
 - One Postgres server holds every service database (`store`, `inventory`, `cart`, `orders`), so they share one WAL: a stopped or idle connector keeps WAL from being
   removed and can fill the disk (`docs/connectors.md`, *WAL, replication slots and the heartbeat*).
-- `store.debezium_heartbeat` and `inventory.debezium_heartbeat` are created by the SQL scripts here, not by the
+- `store.debezium_heartbeat`, `inventory.debezium_heartbeat` and `orders.debezium_heartbeat` are created by the SQL scripts here, not by the
   services' Flyway migrations.
 - Topic sizes here (6 partitions, 14 days) are local values, not production sizing.
 - `localstack/localstack.sh` is not part of any setup step; Terraform creates the LocalStack resources.
